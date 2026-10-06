@@ -35,11 +35,13 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":                 checkRegisterDevice,
+		"open-verification-case":          checkOpenVerificationCase,
+		"record-measurement":              checkRecordMeasurement,
+		"reopen-verification-case":        checkReopenVerificationCase,
+		"seal-verification":               checkSealVerification,
+		"device-retirement":               checkDeviceRetirement,
+		"device-registration-concurrency": checkDeviceRegistrationConcurrency,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +377,375 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkDeviceRetirement() error {
+	h := newHarness()
+	defer h.close()
+
+	// An open, out-of-tolerance case is already in flight when the device is
+	// retired. Retirement must not take away any path to completing that case.
+	deviceID, err := h.createDevice("MET-1501")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	oldCaseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	rejected, err := h.recordMeasurement(oldCaseID, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return err
+	}
+
+	retired, err := h.request(http.MethodPost, "/devices/"+deviceID+"/retire", map[string]any{
+		"reason": "instrument replaced",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(retired, http.StatusOK); err != nil {
+		return err
+	}
+	status, err := nestedString(retired.Body, "device", "status")
+	if err != nil {
+		return err
+	}
+	if status != "retired" {
+		return fmt.Errorf("retired device status = %q", status)
+	}
+
+	// The stranded case can still reopen, measure, and seal on the retired unit.
+	reopened, err := h.request(http.MethodPost, "/cases/"+oldCaseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "new probe installed on the old instrument",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	accepted, err := h.recordMeasurement(oldCaseID, 25.2, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(accepted, http.StatusCreated); err != nil {
+		return err
+	}
+	sealed, err := h.request(http.MethodPost, "/cases/"+oldCaseID+"/seal", map[string]any{
+		"reviewer": "Verifier",
+		"summary":  "sealed after retirement",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+	sealedDevice, err := nestedString(sealed.Body, "seal", "device_id")
+	if err != nil {
+		return err
+	}
+	if sealedDevice != deviceID {
+		return fmt.Errorf("seal device %q does not belong to the original device %q", sealedDevice, deviceID)
+	}
+
+	// Re-enroll the same asset number as a brand new device identity.
+	reenrolled, err := h.request(http.MethodPost, "/devices", map[string]any{
+		"asset_tag": " met-1501 ",
+		"model":     "Replacement Meter",
+		"room":      "Room C",
+		"steward":   "Mira",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reenrolled, http.StatusCreated); err != nil {
+		return err
+	}
+	newDeviceID, err := nestedString(reenrolled.Body, "device", "id")
+	if err != nil {
+		return err
+	}
+	if newDeviceID == deviceID {
+		return errors.New("re-enrollment reused the previous device identity")
+	}
+	enrollment, err := nestedFloat(reenrolled.Body, "device", "enrollment")
+	if err != nil {
+		return err
+	}
+	if enrollment != 2 {
+		return fmt.Errorf("re-enrollment number = %v, expected 2", enrollment)
+	}
+	replaced, err := nestedString(reenrolled.Body, "device", "replaced_device_id")
+	if err != nil {
+		return err
+	}
+	if replaced != deviceID {
+		return fmt.Errorf("replaced_device_id = %q, expected %q", replaced, deviceID)
+	}
+
+	// The new device opens its own case: the sealed case of the previous unit
+	// must not count as an unfinished case for it.
+	newOpened, err := h.openCase(newDeviceID)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(newOpened, http.StatusCreated); err != nil {
+		return err
+	}
+	newCaseID, err := nestedString(newOpened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	if newCaseID == oldCaseID {
+		return errors.New("new device inherited the previous device's case")
+	}
+
+	// The old case view is still readable and still belongs to the old unit;
+	// the new unit's case must not see the old evidence.
+	oldView, err := h.request(http.MethodGet, "/cases/"+oldCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(oldView, http.StatusOK); err != nil {
+		return err
+	}
+	oldViewDevice, err := nestedString(oldView.Body, "case", "device_id")
+	if err != nil {
+		return err
+	}
+	if oldViewDevice != deviceID {
+		return fmt.Errorf("old case device_id = %q, expected %q", oldViewDevice, deviceID)
+	}
+	oldViewSeal, err := nestedString(oldView.Body, "seal", "device_id")
+	if err != nil {
+		return err
+	}
+	if oldViewSeal != deviceID {
+		return fmt.Errorf("old evidence reassigned to %q", oldViewSeal)
+	}
+
+	newView, err := h.request(http.MethodGet, "/cases/"+newCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if _, exists := newView.Body["seal"]; exists {
+		return errors.New("new device can read the previous device's sealed evidence")
+	}
+	if measurements := nestedSliceOrEmpty(newView.Body, "measurements"); len(measurements) != 0 {
+		return fmt.Errorf("new device inherited %d measurement(s) from the previous device", len(measurements))
+	}
+
+	// Two active devices must never share the tag: another enrollment conflicts.
+	again, err := h.request(http.MethodPost, "/devices", map[string]any{
+		"asset_tag": "MET-1501",
+		"model":     "Third Meter",
+		"room":      "Room D",
+		"steward":   "Asha",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(again, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(again, "duplicate_asset_tag")
+}
+
+func checkDeviceRegistrationConcurrency() error {
+	// A never-seen tag registered concurrently: at most one enrollment can win.
+	if err := raceFreshTag("MET-1601"); err != nil {
+		return err
+	}
+
+	// Retire and re-enroll the same tag concurrently: the two requests must be
+	// serialized so the tag never has two active holders.
+	h := newHarness()
+	defer h.close()
+	deviceID, err := h.createDevice("MET-1602")
+	if err != nil {
+		return err
+	}
+
+	results, err := raceRequests(2, func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/devices/"+deviceID+"/retire", map[string]any{
+			"reason": "replaced",
+		})
+	}, func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/devices", map[string]any{
+			"asset_tag": "MET-1602",
+			"model":     "Replacement",
+			"room":      "Room C",
+			"steward":   "Mira",
+		})
+	})
+	if err != nil {
+		return err
+	}
+	created := 0
+	var replacement apiResponse
+	for index, item := range results {
+		switch {
+		case item.Status == http.StatusOK && index == 0:
+		case item.Status == http.StatusCreated && index == 1:
+			created++
+			replacement = item
+		case item.Status == http.StatusConflict && index == 1:
+			// Re-enrollment won the race and ran first; retry once now that the
+			// original unit is retired.
+			created++
+			retry, err := h.request(http.MethodPost, "/devices", map[string]any{
+				"asset_tag": "MET-1602",
+				"model":     "Replacement",
+				"room":      "Room C",
+				"steward":   "Mira",
+			})
+			if err != nil {
+				return err
+			}
+			if err := expectStatus(retry, http.StatusCreated); err != nil {
+				return err
+			}
+			replacement = retry
+		default:
+			return fmt.Errorf("unexpected retire/re-enroll status %d: %s", item.Status, item.Raw)
+		}
+	}
+	if created != 1 {
+		return fmt.Errorf("re-enrollment produced %d new devices", created)
+	}
+	newDeviceID, err := nestedString(replacement.Body, "device", "id")
+	if err != nil {
+		return err
+	}
+	if newDeviceID == deviceID {
+		return errors.New("re-enrollment reused the retired device identity")
+	}
+	oldView, err := h.request(http.MethodGet, "/devices/"+deviceID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(oldView, http.StatusOK); err != nil {
+		return err
+	}
+	oldStatus, err := nestedString(oldView.Body, "device", "status")
+	if err != nil {
+		return err
+	}
+	if oldStatus != "retired" {
+		return fmt.Errorf("original device status = %q, expected retired", oldStatus)
+	}
+	newView, err := h.request(http.MethodGet, "/devices/"+newDeviceID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(newView, http.StatusOK); err != nil {
+		return err
+	}
+	newStatus, err := nestedString(newView.Body, "device", "status")
+	if err != nil {
+		return err
+	}
+	if newStatus != "active" {
+		return fmt.Errorf("re-enrolled device status = %q, expected active", newStatus)
+	}
+
+	// A failed registration must leave no number occupation: a valid retry of
+	// the same tag afterward must still succeed.
+	bad, err := h.request(http.MethodPost, "/devices", map[string]any{
+		"asset_tag": "MET-1603",
+		"model":     "",
+		"room":      "Room A",
+		"steward":   "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(bad, http.StatusBadRequest); err != nil {
+		return err
+	}
+	good, err := h.request(http.MethodPost, "/devices", map[string]any{
+		"asset_tag": "met-1603",
+		"model":     "Bench Meter",
+		"room":      "Room A",
+		"steward":   "Lin",
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(good, http.StatusCreated)
+}
+
+func raceFreshTag(tag string) error {
+	h := newHarness()
+	defer h.close()
+
+	results, err := raceRequests(4, func() (apiResponse, error) {
+		return h.request(http.MethodPost, "/devices", map[string]any{
+			"asset_tag": tag,
+			"model":     "Bench Meter",
+			"room":      "Room A",
+			"steward":   "Lin",
+		})
+	})
+	if err != nil {
+		return err
+	}
+	created := 0
+	conflicts := 0
+	for _, item := range results {
+		switch item.Status {
+		case http.StatusCreated:
+			created++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent register status %d: %s", item.Status, item.Raw)
+		}
+	}
+	if created != 1 || conflicts != len(results)-1 {
+		return fmt.Errorf("concurrent register outcomes: %d created, %d conflicts", created, conflicts)
+	}
+	return nil
+}
+
+func raceRequests(count int, calls ...func() (apiResponse, error)) ([]apiResponse, error) {
+	type outcome struct {
+		index    int
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, count)
+	var wait sync.WaitGroup
+	for index := 0; index < count; index++ {
+		call := calls[index%len(calls)]
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			response, err := call()
+			results <- outcome{index: index, response: response, err: err}
+		}(index)
+	}
+	wait.Wait()
+	close(results)
+
+	ordered := make([]apiResponse, count)
+	for item := range results {
+		if item.err != nil {
+			return nil, item.err
+		}
+		ordered[item.index] = item.response
+	}
+	return ordered, nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -551,6 +922,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 	return flag, nil
 }
 
+func nestedFloat(root map[string]any, path ...string) (float64, error) {
+	value, err := nestedValue(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%s is not a number", strings.Join(path, "."))
+	}
+	return number, nil
+}
+
 func nestedSlice(root map[string]any, key string) ([]any, error) {
 	value, ok := root[key]
 	if !ok {
@@ -561,6 +944,15 @@ func nestedSlice(root map[string]any, key string) ([]any, error) {
 		return nil, fmt.Errorf("%s is not an array", key)
 	}
 	return items, nil
+}
+
+func nestedSliceOrEmpty(root map[string]any, key string) []any {
+	value, ok := root[key]
+	if !ok || value == nil {
+		return nil
+	}
+	items, _ := value.([]any)
+	return items
 }
 
 func hasEvent(root map[string]any, kind string) bool {

@@ -22,6 +22,8 @@ go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
 go run ./cmd/workflowcheck --workflow seal-verification
+go run ./cmd/workflowcheck --workflow device-retirement
+go run ./cmd/workflowcheck --workflow device-registration-concurrency
 ```
 
 The workflow runner starts a fresh in-process HTTP service and exercises the

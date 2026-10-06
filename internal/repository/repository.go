@@ -16,8 +16,6 @@ type Repository struct {
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
-	tagIndex     map[string]string
-	tagIntents   map[string]int
 }
 
 func New() *Repository {
@@ -27,8 +25,6 @@ func New() *Repository {
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
-		tagIndex:     make(map[string]string),
-		tagIntents:   make(map[string]int),
 	}
 }
 
@@ -38,47 +34,11 @@ type Snapshot struct {
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
-	tagIndex     map[string]string
-	tagIntents   map[string]int
 }
 
 func (s Snapshot) Device(id string) (domain.Device, bool) {
 	item, ok := s.devices[id]
 	return item, ok
-}
-
-func (s Snapshot) DeviceByTag(tag string) (domain.Device, bool) {
-	for _, item := range s.devices {
-		if item.AssetTag == tag {
-			return item, true
-		}
-	}
-	return domain.Device{}, false
-}
-
-func (s Snapshot) LatestDeviceByTag(tag string) (domain.Device, bool) {
-	var latest domain.Device
-	found := false
-	for _, item := range s.devices {
-		if item.AssetTag != tag {
-			continue
-		}
-		if !found || item.Enrollment > latest.Enrollment {
-			latest = item
-			found = true
-		}
-	}
-	return latest, found
-}
-
-func (s Snapshot) TagDeviceID(tag string) (string, bool) {
-	value, ok := s.tagIndex[tag]
-	return value, ok
-}
-
-func (s Snapshot) TagIntent(tag string) (int, bool) {
-	value, ok := s.tagIntents[tag]
-	return value, ok
 }
 
 func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
@@ -128,8 +88,6 @@ type Mutation struct {
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
-	tagIndex     map[string]string
-	tagIntents   map[string]int
 }
 
 func (m *Mutation) NextID(prefix string) string {
@@ -142,15 +100,21 @@ func (m *Mutation) Device(id string) (domain.Device, bool) {
 	return item, ok
 }
 
-func (m *Mutation) DeviceByTag(tag string) (domain.Device, bool) {
+// ActiveDeviceByTag reports whether an active device currently holds the
+// normalized asset tag. Identity is derived from the device rows themselves,
+// so callers deciding inside a write transaction never observe stale index
+// state.
+func (m *Mutation) ActiveDeviceByTag(tag string) (domain.Device, bool) {
 	for _, item := range m.devices {
-		if item.AssetTag == tag {
+		if item.AssetTag == tag && item.IsActive() {
 			return item, true
 		}
 	}
 	return domain.Device{}, false
 }
 
+// LatestDeviceByTag returns the device with the highest enrollment number for
+// a normalized asset tag, or false when the tag has never been enrolled.
 func (m *Mutation) LatestDeviceByTag(tag string) (domain.Device, bool) {
 	var latest domain.Device
 	found := false
@@ -164,30 +128,6 @@ func (m *Mutation) LatestDeviceByTag(tag string) (domain.Device, bool) {
 		}
 	}
 	return latest, found
-}
-
-func (m *Mutation) TagDeviceID(tag string) (string, bool) {
-	value, ok := m.tagIndex[tag]
-	return value, ok
-}
-
-func (m *Mutation) SetTagIndex(tag, deviceID string) {
-	m.tagIndex[tag] = deviceID
-}
-
-func (m *Mutation) ClearTagIntent(tag string) {
-	delete(m.tagIntents, tag)
-}
-
-func (m *Mutation) UnfinishedCaseByTag(tag string) (domain.VerificationCase, bool) {
-	for _, item := range m.cases {
-		device, exists := m.devices[item.DeviceID]
-		if !exists || device.AssetTag != tag || !item.IsUnfinished() {
-			continue
-		}
-		return item, true
-	}
-	return domain.VerificationCase{}, false
 }
 
 func (m *Mutation) PutDevice(item domain.Device) error {
@@ -227,6 +167,9 @@ func (m *Mutation) UpdateCase(item domain.VerificationCase) error {
 	return nil
 }
 
+// ActiveCaseForDevice reports the unfinished case that belongs to one specific
+// device identity. A replacement device enrolled under the same asset tag has
+// a different identity and never inherits the previous device's cases.
 func (m *Mutation) ActiveCaseForDevice(deviceID string) (domain.VerificationCase, bool) {
 	for _, item := range m.cases {
 		if item.DeviceID == deviceID && item.IsUnfinished() {
@@ -284,40 +227,10 @@ func (r *Repository) Read(ctx context.Context, fn func(Snapshot) error) error {
 	return fn(r.snapshot())
 }
 
-type EnrollmentDecision struct {
-	Enrollment int
-	Replaces   string
-}
-
-func (r *Repository) DecideEnrollment(ctx context.Context, tag string) (EnrollmentDecision, error) {
-	var decision EnrollmentDecision
-	err := r.Read(ctx, func(snapshot Snapshot) error {
-		if deviceID, ok := snapshot.TagDeviceID(tag); ok {
-			if device, exists := snapshot.Device(deviceID); exists && device.IsActive() {
-				return fmt.Errorf("%w: %s", domain.ErrDuplicateAssetTag, tag)
-			}
-		}
-		if _, ok := snapshot.TagIntent(tag); ok {
-			return fmt.Errorf("%w: %s", domain.ErrDuplicateAssetTag, tag)
-		}
-		if device, exists := snapshot.LatestDeviceByTag(tag); exists {
-			decision.Enrollment = device.Enrollment + 1
-			decision.Replaces = device.ID
-		} else {
-			decision.Enrollment = 1
-		}
-		return nil
-	})
-	return decision, err
-}
-
-func (r *Repository) RecordTagIntent(ctx context.Context, tag string, enrollment int) error {
-	return r.Mutate(ctx, func(next *Mutation) error {
-		next.tagIntents[tag] = enrollment
-		return nil
-	})
-}
-
+// Mutate runs fn against a private copy of the repository state and publishes
+// the result only when fn succeeds. A failed decision rolls back every change,
+// including consumed ID counters, so callers can validate freely inside the
+// transaction without leaving partial records behind.
 func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -332,8 +245,6 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
-		tagIndex:     cloneStringIndex(r.tagIndex),
-		tagIntents:   cloneCounters(r.tagIntents),
 	}
 	if err := fn(next); err != nil {
 		return err
@@ -344,8 +255,6 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.seals = next.seals
 	r.events = next.events
 	r.counters = next.counters
-	r.tagIndex = next.tagIndex
-	r.tagIntents = next.tagIntents
 	return nil
 }
 
@@ -356,8 +265,6 @@ func (r *Repository) snapshot() Snapshot {
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
-		tagIndex:     cloneStringIndex(r.tagIndex),
-		tagIntents:   cloneCounters(r.tagIntents),
 	}
 }
 
@@ -395,14 +302,6 @@ func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.Evidenc
 
 func cloneCounters(values map[string]int) map[string]int {
 	result := make(map[string]int, len(values))
-	for key, value := range values {
-		result[key] = value
-	}
-	return result
-}
-
-func cloneStringIndex(values map[string]string) map[string]string {
-	result := make(map[string]string, len(values))
 	for key, value := range values {
 		result[key] = value
 	}

@@ -26,22 +26,28 @@ func NewService(repo *repository.Repository) *Service {
 func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDeviceRequest) (domain.Device, error) {
 	var created domain.Device
 	tag := domain.NormalizeAssetTag(input.AssetTag)
-	decision, err := s.repository.DecideEnrollment(ctx, tag)
-	if err != nil {
-		return created, err
-	}
-	if err := s.repository.RecordTagIntent(ctx, tag, decision.Enrollment); err != nil {
-		return created, err
-	}
-	err = s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		// The uniqueness decision and the insert share one write lock, so the
+		// tag can never have two active holders even when retirement and
+		// re-enrollment race. Any failure below aborts the transaction: no
+		// device, no tag occupation, and no event is left behind.
+		if holder, exists := m.ActiveDeviceByTag(tag); exists {
+			return fmt.Errorf("%w: %s is held by active device %s", domain.ErrDuplicateAssetTag, tag, holder.ID)
+		}
+		enrollment := 1
+		replaces := ""
+		if previous, exists := m.LatestDeviceByTag(tag); exists {
+			enrollment = previous.Enrollment + 1
+			replaces = previous.ID
+		}
 		item, err := domain.NewDeviceRegistration(
 			m.NextID("device"),
 			input.AssetTag,
 			input.Model,
 			input.Room,
 			input.Steward,
-			decision.Enrollment,
-			decision.Replaces,
+			enrollment,
+			replaces,
 			s.now(),
 		)
 		if err != nil {
@@ -50,11 +56,9 @@ func (s *Service) RegisterDevice(ctx context.Context, input contracts.RegisterDe
 		if err := m.PutDevice(item); err != nil {
 			return err
 		}
-		m.SetTagIndex(tag, item.ID)
-		m.ClearTagIntent(tag)
 		kind := "device_enrolled"
 		detail := "device enrolled for assurance work"
-		if decision.Replaces != "" {
+		if replaces != "" {
 			kind = "device_reenrolled"
 			detail = "device re-enrolled after the previous unit was retired"
 		}
@@ -136,7 +140,7 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if !device.IsActive() {
 			return fmt.Errorf("%w: device %s is %s", domain.ErrStateConflict, device.ID, device.Status)
 		}
-		if active, exists := m.UnfinishedCaseByTag(device.AssetTag); exists {
+		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
 			return fmt.Errorf("%w: case %s is still %s", domain.ErrActiveCaseExists, active.ID, active.State)
 		}
 		item, err := domain.NewVerificationCase(
@@ -194,9 +198,8 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if device, exists := m.Device(item.DeviceID); !exists || !device.IsActive() {
-			return fmt.Errorf("%w: device %s is not active", domain.ErrStateConflict, item.DeviceID)
-		}
+		// Case work is bound to the device identity that opened it and keeps
+		// every path to completion even after that device is retired.
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -252,19 +255,16 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if device, exists := m.Device(item.DeviceID); !exists || !device.IsActive() {
-			return fmt.Errorf("%w: device %s is not active", domain.ErrStateConflict, item.DeviceID)
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		if err := item.Reopen(s.now()); err != nil {
 			return err
 		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
-		}
-		actor := strings.TrimSpace(input.Actor)
-		reason := strings.TrimSpace(input.Reason)
-		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -293,9 +293,6 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		item, exists := m.Case(id)
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
-		}
-		if device, exists := m.Device(item.DeviceID); !exists || !device.IsActive() {
-			return fmt.Errorf("%w: device %s is not active", domain.ErrStateConflict, item.DeviceID)
 		}
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
@@ -367,11 +364,6 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
-		if device, ok := m.Device(item.DeviceID); ok {
-			if current, ok := m.LatestDeviceByTag(device.AssetTag); ok {
-				seal.DeviceID = current.ID
-			}
-		}
 		result.Seal = &seal
 	}
 	return result
@@ -384,11 +376,6 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
-		if device, ok := snapshot.Device(item.DeviceID); ok {
-			if current, ok := snapshot.LatestDeviceByTag(device.AssetTag); ok {
-				seal.DeviceID = current.ID
-			}
-		}
 		result.Seal = &seal
 	}
 	return result
